@@ -1,7 +1,6 @@
 package types
 
 import (
-	"bytes"
 	"encoding/binary"
 	"reflect"
 	"strconv"
@@ -17,20 +16,17 @@ import (
 // is chosen as the default value given its simplicity to represent unbounded size.
 var UnboundedSSZFieldSizeMarker = "?"
 
-type structSSZ struct {
-	hashCache map[string]interface{}
-}
+type structSSZ struct{}
 
 func newStructSSZ() *structSSZ {
-	return &structSSZ{
-		hashCache: make(map[string]interface{}),
-	}
+	return &structSSZ{}
 }
 
 func (b *structSSZ) Root(val reflect.Value, typ reflect.Type, maxCapacity uint64) ([32]byte, error) {
 	if typ.Kind() == reflect.Ptr {
 		if val.IsNil() {
-			return [32]byte{}, nil
+			instance := reflect.New(typ.Elem()).Elem()
+			return b.Root(instance, instance.Type(), maxCapacity)
 		}
 		return b.Root(val.Elem(), typ.Elem(), maxCapacity)
 	}
@@ -49,8 +45,8 @@ func (b *structSSZ) FieldsHasher(val reflect.Value, typ reflect.Type, numFields 
 		}
 		totalCountedFields++
 		fCapacity := determineFieldCapacity(typ.Field(i))
-		if typ.Field(i).Name == "AggregationBits" || typ.Field(i).Name == "CustodyBits" {
-			r, err := bitlistRoot(val.Field(i), fCapacity)
+		if b, ok := val.Field(i).Interface().(bitfield.Bitlist); ok {
+			r, err := BitlistRoot(b, fCapacity)
 			if err != nil {
 				return [32]byte{}, nil
 			}
@@ -102,7 +98,12 @@ func (b *structSSZ) Marshal(val reflect.Value, typ reflect.Type, buf []byte, sta
 		if isVariableSizeType(fType) {
 			fixedLength += BytesPerLengthOffset
 		} else {
-			fixedLength += determineFixedSize(val.Field(i), fType)
+			if val.Type().Kind() == reflect.Ptr && val.IsNil() {
+				elem := reflect.New(val.Type().Elem()).Elem()
+				fixedLength += determineFixedSize(elem, fType)
+			} else {
+				fixedLength += determineFixedSize(val.Field(i), fType)
+			}
 		}
 	}
 	currentOffsetIndex := startOffset + fixedLength
@@ -163,47 +164,40 @@ func (b *structSSZ) Unmarshal(val reflect.Value, typ reflect.Type, input []byte,
 		numFields++
 	}
 
-	fixedSizes := make([]uint64, numFields)
-	for i := 0; i < len(fixedSizes); i++ {
-		// We skip protobuf related metadata fields.
-		if strings.Contains(typ.Field(i).Name, "XXX_") {
-			continue
-		}
+	fixedSizes := make(map[int]uint64)
+	for i := 0; i < numFields; i++ {
 		fType, err := determineFieldType(typ.Field(i))
 		if err != nil {
 			return 0, err
 		}
-		if !isVariableSizeType(fType) {
-			if val.Field(i).Kind() == reflect.Ptr {
-				instantiateConcreteTypeForElement(val.Field(i), fType.Elem())
-			}
-			concreteVal := val.Field(i)
-			sszSizeTags, hasTags, err := parseSSZFieldTags(typ.Field(i))
-			if err != nil {
-				return 0, err
-			}
-			if hasTags {
-				concreteType := inferFieldTypeFromSizeTags(typ.Field(i), sszSizeTags)
-				concreteVal = reflect.New(concreteType).Elem()
-				// If the item is a slice, we grow it accordingly based on the size tags.
-				if val.Field(i).Kind() == reflect.Slice {
-					result := growSliceFromSizeTags(val.Field(i), sszSizeTags)
-					val.Field(i).Set(result)
-				}
-			}
-			fixedSz := determineFixedSize(concreteVal, fType)
-			if fixedSz > 0 {
-				fixedSizes[i] = fixedSz
-			}
-		} else {
-			fixedSizes[i] = 0
+		if isVariableSizeType(fType) {
+			continue
 		}
+		if val.Field(i).Kind() == reflect.Ptr {
+			instantiateConcreteTypeForElement(val.Field(i), fType.Elem())
+		}
+		concreteVal := val.Field(i)
+		sszSizeTags, hasTags, err := parseSSZFieldTags(typ.Field(i))
+		if err != nil {
+			return 0, err
+		}
+		if hasTags {
+			concreteType := inferFieldTypeFromSizeTags(typ.Field(i), sszSizeTags)
+			concreteVal = reflect.New(concreteType).Elem()
+			// If the item is a slice, we grow it accordingly based on the size tags.
+			if val.Field(i).Kind() == reflect.Slice {
+				result := growSliceFromSizeTags(val.Field(i), sszSizeTags)
+				val.Field(i).Set(result)
+			}
+		}
+		fixedSz := determineFixedSize(concreteVal, fType)
+		fixedSizes[i] = fixedSz
 	}
 
 	offsets := make([]uint64, 0)
 	offsetIndexCounter := startOffset
-	for _, item := range fixedSizes {
-		if item > 0 {
+	for i := 0; i < numFields; i++ {
+		if item, ok := fixedSizes[i]; ok {
 			offsetIndexCounter += item
 		} else {
 			if offsetIndexCounter+BytesPerLengthOffset > uint64(len(input)) {
@@ -217,12 +211,7 @@ func (b *structSSZ) Unmarshal(val reflect.Value, typ reflect.Type, input []byte,
 	}
 	offsets = append(offsets, endOffset)
 	offsetIndex := uint64(0)
-	for i := 0; i < typ.NumField(); i++ {
-		// We skip protobuf related metadata fields.
-		if strings.Contains(typ.Field(i).Name, "XXX_") {
-			continue
-		}
-		fieldSize := fixedSizes[i]
+	for i := 0; i < numFields; i++ {
 		fType, err := determineFieldType(typ.Field(i))
 		if err != nil {
 			return 0, err
@@ -234,8 +223,11 @@ func (b *structSSZ) Unmarshal(val reflect.Value, typ reflect.Type, input []byte,
 		if err != nil {
 			return 0, err
 		}
-		if fieldSize > 0 {
-			nextIndex = currentIndex + fieldSize
+		if item, ok := fixedSizes[i]; ok {
+			if item == 0 {
+				continue
+			}
+			nextIndex = currentIndex + item
 			if _, err := factory.Unmarshal(val.Field(i), fType, input[currentIndex:nextIndex], 0); err != nil {
 				return 0, err
 			}
@@ -255,34 +247,6 @@ func (b *structSSZ) Unmarshal(val reflect.Value, typ reflect.Type, input []byte,
 		}
 	}
 	return currentIndex, nil
-}
-
-func bitlistRoot(val reflect.Value, maxCapacity uint64) ([32]byte, error) {
-	limit := (maxCapacity + 255) / 256
-	if val.IsNil() {
-		length := make([]byte, 32)
-		root, err := bitwiseMerkleize([][]byte{}, 0, limit)
-		if err != nil {
-			return [32]byte{}, err
-		}
-		return mixInLength(root, length), nil
-	}
-	bfield := val.Interface().(bitfield.Bitlist)
-	chunks, err := pack([][]byte{bfield.Bytes()})
-	if err != nil {
-		return [32]byte{}, err
-	}
-	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.LittleEndian, bfield.Len()); err != nil {
-		return [32]byte{}, err
-	}
-	output := make([]byte, 32)
-	copy(output, buf.Bytes())
-	root, err := bitwiseMerkleize(chunks, uint64(len(chunks)), limit)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	return mixInLength(root, output), nil
 }
 
 func determineFieldType(field reflect.StructField) (reflect.Type, error) {

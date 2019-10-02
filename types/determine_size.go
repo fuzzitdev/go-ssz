@@ -10,7 +10,7 @@ import (
 func DetermineSize(val reflect.Value) uint64 {
 	if val.Kind() == reflect.Ptr {
 		if val.IsNil() {
-			return DetermineSize(reflect.New(val.Type()).Elem())
+			return DetermineSize(reflect.New(val.Type().Elem()).Elem())
 		}
 		return DetermineSize(val.Elem())
 	}
@@ -48,6 +48,9 @@ func isVariableSizeType(typ reflect.Type) bool {
 		return isVariableSizeType(typ.Elem())
 	case kind == reflect.Struct:
 		for i := 0; i < typ.NumField(); i++ {
+			if strings.Contains(typ.Field(i).Name, "XXX_") {
+				continue
+			}
 			f := typ.Field(i)
 			fType, err := determineFieldType(f)
 			if err != nil {
